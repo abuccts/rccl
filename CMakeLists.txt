@@ -138,7 +138,8 @@ else()
       src/collectives/device/reduce_scatter.cu
       src/collectives/device/sendrecv.cu
       src/collectives/device/onerank_reduce.cu
-      src/collectives/device/functions.cu)
+      src/collectives/device/functions.cu
+      src/collectives/device/stride_copy.cu)
 endif()
 
 set(CPP_SOURCES)

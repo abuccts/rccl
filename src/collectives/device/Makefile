@@ -38,9 +38,12 @@ $(RULESFILE) :
 
 LIBOBJ     := $(GENOBJS) $(OBJDIR)/functions.o $(OBJDIR)/onerank_reduce.o
 
+CUSTOMLIBOBJ := $(OBJDIR)/stride_copy_lib.o
+CUSTOMDEVOBJ := $(OBJDIR)/stride_copy_dev.o
+
 -include $(DEPFILES)
 
-$(STATICLIB): $(LIBOBJ) $(DEVOBJ)
+$(STATICLIB): $(LIBOBJ) $(DEVOBJ) $(CUSTOMLIBOBJ) $(CUSTOMDEVOBJ)
 	@printf "Archiving  %-35s > %s\n" objects $@
 	ar cr $@ $^
 
@@ -67,6 +70,16 @@ $(OBJDIR)/onerank_reduce.o : onerank_reduce.cu $(OBJDIR)/onerank_reduce.dep
 	@printf "Compiling  %-35s > %s\n" $< $@
 	mkdir -p `dirname $@`
 	$(NVCC) $(NVCUFLAGS) -dc $< -o $@
+
+$(OBJDIR)/%_lib.o : %.cu
+	@printf "Compiling  %-35s > %s\n" $< $@
+	mkdir -p `dirname $@`
+	$(NVCC) $(NVCUFLAGS) -dc $< -o $@
+
+$(OBJDIR)/%_dev.o : $(OBJDIR)/%_lib.o
+	@printf "Compiling  %-35s > %s\n" $< $@
+	mkdir -p `dirname $@`
+	$(NVCC) $(NVCUFLAGS) -dlink $< -o $@
 
 # ... and create the device-side linked object with all those.
 $(DEVOBJ) : $(LIBOBJ)
