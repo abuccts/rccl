@@ -1,6 +1,8 @@
 # Copyright (c) 2019-2020 Advanced Micro Devices, Inc. All rights reserved.
 
 cmake_minimum_required(VERSION 3.5)
+INCLUDE(CheckIncludeFiles)
+INCLUDE(CheckSymbolExists)
 
 # We use C++14 features, this will add compile option: -std=c++14
 set( CMAKE_CXX_STANDARD 14 )
@@ -174,12 +176,6 @@ set(CC_SOURCES
     src/collectives/all_to_all_api.cc
     src/collectives/all_to_allv_api.cc
     src/channel.cc
-    #src/clique/CliqueManager.cc     # RCCL
-    #src/clique/HandleCache.cc       # RCCL
-    #src/clique/HandleShm.cc         # RCCL
-    #src/clique/Hash.cc              # RCCL
-    #src/clique/MsgQueue.cc          # RCCL
-    #src/clique/ShmObject.cc         # RCCL
     src/misc/argcheck.cc
     src/misc/nvmlwrap_stub.cc
     src/misc/utils.cc
@@ -187,9 +183,13 @@ set(CC_SOURCES
     src/misc/nvmlwrap_stub.cc
     src/misc/rocm_smi_wrap.cc
     src/misc/profiler.cc
+    src/misc/npkit.cc
     src/misc/shmutils.cc
+    src/misc/signals.cc              # RCCL
     src/misc/socket.cc
     src/misc/param.cc
+    src/misc/rocmwrap.cc
+    src/misc/strongstream.cc
     src/transport/coll_net.cc
     src/transport/net.cc
     src/transport/net_ib.cc
@@ -202,13 +202,28 @@ set(CC_SOURCES
     src/bootstrap.cc
     src/proxy.cc
     src/net.cc
-    src/enqueue.cc)
+    src/enqueue.cc
+    ${CMAKE_CURRENT_BINARY_DIR}/git_version.cpp)
 
 foreach(filename ${CC_SOURCES})
   list(APPEND CPP_SOURCES ${filename})
 endforeach(filename)
 
 add_library(rccl ${CPP_SOURCES})
+
+# Create a custom target that creates/updates git_version.cpp
+# that executes whenever rccl is built
+add_custom_target(git_version_check
+  COMMENT "Updating git_version.cpp if necessary"
+  COMMAND ${CMAKE_COMMAND} -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/git_version.cmake
+  VERBATIM
+)
+
+# Create a dummy git_version.cpp file in case it doesn't exist
+configure_file(src/nccl.h.in ${CMAKE_CURRENT_BINARY_DIR}/git_version.cpp)
+
+# Execute git_version_check whenever rccl library is built
+add_dependencies(rccl git_version_check)
 
 if(TRACE)
   add_definitions(-DENABLE_TRACE)
@@ -218,11 +233,53 @@ if(PROFILE)
   add_definitions(-DENABLE_PROFILING)
 endif()
 
+if(NPKIT_FLAGS)
+  add_definitions(${NPKIT_FLAGS})
+endif()
+
 set(COLLTRACE 1 CACHE BOOL "Collective Trace Option")
 if(COLLTRACE)
   add_definitions(-DENABLE_COLLTRACE)
 endif()
 
+enable_language(C)
+CHECK_INCLUDE_FILES(bfd.h HAVE_BFD)
+if (HAVE_BFD)
+  add_definitions(-DHAVE_BFD)
+  message ("-- Found BFD")
+  CHECK_SYMBOL_EXISTS(bfd_get_section_flags "bfd.h" HAVE_DECL_BFD_GET_SECTION_FLAGS)
+  if (HAVE_DECL_BFD_GET_SECTION_FLAGS)
+    add_definitions(-DHAVE_DECL_BFD_GET_SECTION_FLAGS)
+  endif()
+  CHECK_SYMBOL_EXISTS(bfd_get_section_vma "bfd.h" HAVE_DECL_BFD_GET_SECTION_VMA)
+  if (HAVE_DECL_BFD_GET_SECTION_VMA)
+    add_definitions(-DHAVE_DECL_BFD_GET_SECTION_VMA)
+  endif()
+  CHECK_CXX_SOURCE_COMPILES(
+    "#include <bfd.h>
+
+       int main (int argc, char **argv) {
+         bfd_size_type size;
+         bfd abfd;
+         asection sec;
+         size = bfd_section_size(&abfd, &sec);
+         return (int)(size);
+       }"
+    HAVE_TWO_ARG_BFD_SECTION_SIZE)
+  if (HAVE_TWO_ARG_BFD_SECTION_SIZE)
+    add_definitions(-DHAVE_TWO_ARG_BFD_SECTION_SIZE)
+  endif()
+  find_path(DEMANGLE_HEADER demangle.h PATHS /usr/include PATH_SUFFIXES libiberty)
+  if(NOT DEMANGLE_HEADER)
+    message("Could not find demangle.h ${DEMANGLE_HEADER}")
+  else()
+    add_definitions(-DHAVE_CPLUS_DEMANGLE)
+    message("Found demangle.h in ${DEMANGLE_HEADER}")
+    set (HAVE_CPLUS_DEMANGLE  1)
+    set (HAVE_DECL_BASENAME  "1")
+    INCLUDE_DIRECTORIES(${DEMANGLE_HEADER})
+  endif()
+endif()
 
 find_package(rocm_smi PATHS ${ROCM_PATH}/lib/cmake/rocm_smi)
 if (rocm_smi_FOUND)
@@ -244,7 +301,7 @@ foreach(target ${AMDGPU_TARGETS})
 endforeach()
 
 if("${HIP_COMPILER}" MATCHES "clang")
-  target_compile_options(rccl PRIVATE -fvisibility=hidden)
+  target_compile_options(rccl PRIVATE -fvisibility=hidden --hipcc-func-supp)
   foreach(target ${AMDGPU_TARGETS})
     target_compile_options(rccl PRIVATE -fgpu-rdc)
   endforeach()
@@ -281,13 +338,23 @@ target_include_directories(rccl PRIVATE ${ROCM_SMI_INCLUDE_DIR})
 target_link_libraries(rccl PRIVATE hip::device dl -l${ROCM_SMI_LIBRARIES} -L${ROCM_SMI_LIB_DIR})
 target_link_libraries(rccl INTERFACE hip::host)
 
+if(HAVE_BFD)
+  target_link_libraries(rccl PRIVATE bfd dl z)
+  find_library(HAVE_IBERTY iberty PATHS /usr/lib64 /usr/lib/
+    PATH_SUFFIXES x86_64-linux-gnu)
+  if(HAVE_IBERTY)
+    message("iberty found @  ${HAVE_IBERTY} ")
+    target_link_libraries(rccl PRIVATE iberty dl z)
+  endif()
+endif()
+
 #Setup librccl.so version
 rocm_set_soversion(rccl "1.0")
 
 rocm_install_targets(TARGETS
                      rccl
 		     )
-rocm_install(FILES ${PROJECT_BINARY_DIR}/include/rccl/rccl.h
+rocm_install(FILES ${PROJECT_BINARY_DIR}/include/rccl/rccl.h src/include/nccl_net.h
         DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/rccl)
 
 rocm_export_targets(NAMESPACE
@@ -301,11 +368,11 @@ if(BUILD_FILE_REORG_BACKWARD_COMPATIBILITY)
   rocm_wrap_header_dir( "${PROJECT_BINARY_DIR}/include/rccl"
             PATTERNS "rccl.h"
             GUARDS SYMLINK WRAPPER
-            WRAPPER_LOCATIONS include rccl/include)  
+            WRAPPER_LOCATIONS ${CMAKE_INSTALL_INCLUDEDIR} rccl/${CMAKE_INSTALL_INCLUDEDIR})
   #install the wrapper header file to package
-  rocm_install( FILES "${PROJECT_BINARY_DIR}/rccl/include/rccl.h"
-	        DESTINATION "./rccl/include/" )
-  rocm_install( FILES "${PROJECT_BINARY_DIR}/include/rccl.h"
+  rocm_install( FILES ${PROJECT_BINARY_DIR}/rccl/include/rccl.h src/include/nccl_net.h
+	        DESTINATION "./rccl/${CMAKE_INSTALL_INCLUDEDIR}/" )
+  rocm_install( FILES ${PROJECT_BINARY_DIR}/include/rccl.h src/include/nccl_net.h
                 DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/" )
 endif()
 

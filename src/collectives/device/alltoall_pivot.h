@@ -12,15 +12,15 @@ namespace {
   template<typename T, typename RedOp, typename Proto>
   __device__ __attribute__((noinline)) void runRing(ncclWorkElem *args) {
     const int tid = threadIdx.x;
-    const int nthreads = args->header.nWarps*WARP_SIZE;
+    const int nthreads = args->nWarps*WARP_SIZE;
     const int bid = args->bid;
-    const int nranks = ncclShmem->comm.nRanks;
-    const ncclRing *ring = &ncclShmem->channel.ring;
+    const int nranks = ncclShmem.comm.nRanks;
+    const ncclRing *ring = &ncclShmem.channel.ring;
     const int num_bi_rings = args->pivotA2ANumBiRings;
     const int num_uni_rings = num_bi_rings * 2;
     const int num_chunks = args->nChannels / 2;
     const int chunk_id = (bid % num_bi_rings) + (bid / num_uni_rings * num_bi_rings);
-    const int elem_size = args->count % 256 ? 1 : 256;
+    const int elem_size = min(256, args->count & (~(args->count) + 1));
     const ssize_t num_elems = args->count / elem_size;
     const int num_padding_chunks = num_elems % num_chunks;
     const ssize_t chunk_offset = elem_size * (num_elems / num_chunks * chunk_id + (chunk_id < num_padding_chunks ? chunk_id : num_padding_chunks));
@@ -29,11 +29,11 @@ namespace {
     const ssize_t prims_size = int(Proto::calcBytePerStep()/sizeof(T) * (Proto::Id == NCCL_PROTO_SIMPLE ? ALLTOALL_PIVOT_CHUNKSTEPS : 1));
 
     Primitives<T, RedOp, FanSymmetric<1>, 0, Proto, 0> prims
-      (tid, nthreads, &ring->prev, &ring->next, args->sendbuff, args->recvbuff, /*redOpArg(ignored)=*/0, args->connIndex << 16);
+      (tid, nthreads, &ring->prev, &ring->next, args->sendbuff, args->recvbuff, /*redOpArg(ignored)=*/0);
 
     for (int num_hops = 0; num_hops <= nranks / 2; num_hops++) {
-      const int src_rank = ring->devUserRanks[(nranks - num_hops) % nranks];
-      const int dst_rank = ring->devUserRanks[num_hops];
+      const int src_rank = ring->userRanks[(nranks - num_hops) % nranks];
+      const int dst_rank = ring->userRanks[num_hops];
       const ssize_t send_offset =
           dst_rank * num_elems * elem_size + chunk_offset +
           (src_rank == dst_rank ? pivot_direction * chunk_size / 2 : 0);
@@ -71,7 +71,7 @@ namespace {
 
 template<typename T, typename RedOp>
 struct RunWorkElement<ncclFuncAllToAllPivot, T, RedOp, NCCL_ALGO_RING, NCCL_PROTO_SIMPLE> {
-  __device__ __attribute__((noinline)) void run(ncclWorkElem *args) {
+  __device__ __forceinline__ void run(ncclWorkElem *args) {
     using Proto = ProtoSimple<ALLTOALL_PIVOT_CHUNKSTEPS/ALLTOALL_PIVOT_SLICESTEPS, ALLTOALL_PIVOT_SLICESTEPS>;
     runRing<T, RedOp, Proto>(args);
   }

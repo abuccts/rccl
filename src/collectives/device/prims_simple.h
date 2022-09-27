@@ -5,6 +5,10 @@
  * See LICENSE.txt for license information
  ************************************************************************/
 
+#if defined(ENABLE_NPKIT)
+#include "npkit/npkit.h"
+#endif
+
 template<typename T, typename RedOp, typename Fan, int Direct,
          int SlicePerChunk, int StepPerSlice, int Unroll, int P2p>
 class Primitives<
@@ -46,7 +50,16 @@ class Primitives<
   uint64_t connStepCache; // Cache last seen value of (*connStepPtr)
   uint64_t* barriers;
   uint64_t* barrier_next;
-  const uint64_t opCount;
+  uint32_t* next_hdp_reg;
+
+#if defined(ENABLE_NPKIT)
+public:
+  int npKitCtxIdx = 0;
+  uint64_t npKitDataProcessEntryTime = 0;
+  uint64_t npKitDataProcessExitTime = 0;
+  uint64_t npKitDataProcessTotalTime = 0;
+private:
+#endif
 
   // Don't use barrier 0 as it's used by the final sync
   inline __device__ void barrier() {
@@ -77,7 +90,7 @@ class Primitives<
   inline __device__ bool checkAbort(int &spins) {
     spins++;
     if (!(flags & Aborted) && spins == NCCL_SPINS_BEFORE_CHECK_ABORT) {
-      flags |= atomicAdd_system((unsigned int *)ncclShmem->comm.abortFlag, 0) ? Aborted : 0;
+      flags |= atomicAdd_system((unsigned int *)ncclShmem.comm.abortFlag, 0) ? Aborted : 0;
       spins = 0;
     }
     return flags & Aborted;
@@ -92,20 +105,21 @@ class Primitives<
         ((flags & (Send*RoleWaitSend)) && !noSendWait)) {
       int spins = 0;
       while (connStepCache + (isSendNotRecv ? NCCL_STEPS : 0) < step + StepPerSlice) {
-        __builtin_amdgcn_s_sleep(8);
-        connStepCache = LOAD(connStepPtr);
+        __builtin_amdgcn_s_sleep(1);
+        connStepCache = atomicAdd_system((unsigned long long *)connStepPtr, 0);
         if (checkAbort(spins)) break;
-        //if (spins == 0) printf("r=%d b=%d t=%d SPUN OUT got=%d want=%d\n", ncclShmem->comm.rank, blockIdx.x, threadIdx.x, int(connStepCache + (isSendNotRecv ? NCCL_STEPS : 0)), int(step+StepPerSlice));
+        //if (spins == 0) printf("r=%d b=%d t=%d SPUN OUT got=%d want=%d\n", ncclShmem.comm.rank, blockIdx.x, threadIdx.x, int(connStepCache + (isSendNotRecv ? NCCL_STEPS : 0)), int(step+StepPerSlice));
+        if (spins == 0) traceData(__LINE__, threadIdx.x, int(connStepCache + (isSendNotRecv ? NCCL_STEPS : 0)), int(step+StepPerSlice));
       }
       __asm__ __volatile__("s_wakeup");
     }
 
     if (flags & (Recv*RoleWaitRecv | Send*RoleWaitSend)) {
       if (isSendNotRecv && (flags & SizesFifoEnabled))
-        STORE(connSizesFifoPtr+step%NCCL_STEPS, nelts*sizeof(T));
+        __atomic_store_n((connSizesFifoPtr+step%NCCL_STEPS), nelts*sizeof(T), __ATOMIC_SEQ_CST);
 
-      void **ptrs = isSendNotRecv ? (ncclShmem->groups[group].dsts + Dst)
-                                  : (ncclShmem->groups[group].srcs + Src);
+      void **ptrs = isSendNotRecv ? (ncclShmem.groups[group].dsts + Dst)
+                                  : (ncclShmem.groups[group].srcs + Src);
       if (flags & OffsFifoEnabled)
         ptrs[index] = connEltsFifo + loadInt(connOffsFifoPtr + (step%NCCL_STEPS))/sizeof(T);
       else if (isSendNotRecv && DirectSend) {
@@ -134,9 +148,16 @@ class Primitives<
 
   template<int Recv, int Send>
   inline __device__ void postPeer() {
+    if ((flags & Send*RolePostSend) && next_hdp_reg)
+      atomicExch_system(next_hdp_reg, 0x1);
+
     if (flags & (Recv*RolePostRecv | Send*RolePostSend)) {
       step += StepPerSlice;
+#if defined(__gfx90a__)
       atomicExch_system((unsigned long long *)connStepPtr, step);
+#else
+      __atomic_store_n(connStepPtr, step, __ATOMIC_SEQ_CST);
+#endif
     }
   }
 
@@ -179,54 +200,134 @@ class Primitives<
       //     barrier();
       //     post();
       //   } // Since we no longer unroll, new branch added here
-      #pragma unroll 1
       do {
         sliceSize = sliceSize < nelem-offset ? sliceSize : nelem-offset;
         if (Src && (flags & (SrcBuf==Input ? RoleInput : RoleOutput)))
-          ncclShmem->groups[group].srcs[0] = userBuff + srcIx + offset;
+          ncclShmem.groups[group].srcs[0] = userBuff + srcIx + offset;
         if (Dst && (flags & (DstBuf==Input ? RoleInput : RoleOutput)))
-          ncclShmem->groups[group].dsts[0] = userBuff + dstIx + offset;
-#ifdef ENABLE_PROFILING
-        uint64_t t0;
-        if (tid == 0) t0 = __builtin_amdgcn_s_memrealtime();
-#endif
+          ncclShmem.groups[group].dsts[0] = userBuff + dstIx + offset;
         waitPeer<DirectRecv, DirectSend, Recv, Send, Src, Dst>(dstIx, remoteIx, offset, sliceSize);
         subBarrier();
-#ifdef ENABLE_PROFILING
-        if (tid == 0) {
-          struct ncclProfElem *elem = ncclShmem->comm.devProf.elems+opCount%PROFILE_NUM_ITEMS;
-          elem->elem[blockIdx.x].wait_cycle += (__builtin_amdgcn_s_memrealtime() - t0);
-        }
-#endif
-        if (DirectRecv && ncclShmem->groups[group].srcs[0] == ncclShmem->groups[group].dsts[0]) {
+        if (DirectRecv && ncclShmem.groups[group].srcs[0] == ncclShmem.groups[group].dsts[0]) {
           // We can only have one direct receive. Since srcs[0] == dstPtr+offset, skip one copy
           if (Send) {
+
+#if defined(ENABLE_NPKIT) && defined(ENABLE_NPKIT_EVENT_PRIM_SIMPLE_REDUCE_OR_COPY_MULTI_ENTRY)
+            if (tid == 0) {
+              NpKit::CollectGpuEvent(NPKIT_EVENT_PRIM_SIMPLE_REDUCE_OR_COPY_MULTI_ENTRY, sliceSize*sizeof(T), 0, __builtin_amdgcn_s_memrealtime(),
+                  ncclShmem.comm.npKitEventCollectContexts + npKitCtxIdx);
+            }
+#endif
+
+#if defined(ENABLE_NPKIT) && defined(ENABLE_NPKIT_PRIM_COLLECT_DATA_PROCESS_TIME)
+            if (tid == 0) {
+              npKitDataProcessEntryTime = __builtin_amdgcn_s_memrealtime();
+            }
+#endif
+
             // (1-Send) is only there to avoid compilation errors in case MaxSend=0 (and Send=0).
             ReduceOrCopyMulti<Unroll, RedOp, T, 1, 1, 1, (1-Send)+MaxSend, 0>
               (tid, nworkers, nullptr, false,
-               1, (T const**)ncclShmem->groups[group].srcs,
-               fan.nsend(), (T**)ncclShmem->groups[group].dsts+1,
+               1, (T const**)ncclShmem.groups[group].srcs,
+               fan.nsend(), (T**)ncclShmem.groups[group].dsts+1,
                sliceSize);
+
+#if defined(ENABLE_NPKIT) && defined(ENABLE_NPKIT_PRIM_COLLECT_DATA_PROCESS_TIME)
+            if (tid == 0) {
+              npKitDataProcessExitTime = __builtin_amdgcn_s_memrealtime();
+              npKitDataProcessTotalTime += npKitDataProcessExitTime - npKitDataProcessEntryTime;
+            }
+#endif
+
+#if defined(ENABLE_NPKIT) && defined(ENABLE_NPKIT_EVENT_PRIM_SIMPLE_REDUCE_OR_COPY_MULTI_EXIT)
+            if (tid == 0) {
+              NpKit::CollectGpuEvent(NPKIT_EVENT_PRIM_SIMPLE_REDUCE_OR_COPY_MULTI_EXIT, sliceSize*sizeof(T), 0, __builtin_amdgcn_s_memrealtime(),
+                  ncclShmem.comm.npKitEventCollectContexts + npKitCtxIdx);
+            }
+#endif
+
           }
-        } else if (DirectSend && !DirectRecv && SrcBuf != Input && ncclShmem->groups[group].dsts[Dst] == nullptr) {
+        } else if (DirectSend && !DirectRecv && SrcBuf != Input && ncclShmem.groups[group].dsts[Dst] == nullptr) {
           // For broadcast in CollNet to do empty send
+
+#if defined(ENABLE_NPKIT) && defined(ENABLE_NPKIT_EVENT_PRIM_SIMPLE_REDUCE_OR_COPY_MULTI_ENTRY)
+          if (tid == 0) {
+            NpKit::CollectGpuEvent(NPKIT_EVENT_PRIM_SIMPLE_REDUCE_OR_COPY_MULTI_ENTRY, sliceSize*sizeof(T), 0, __builtin_amdgcn_s_memrealtime(),
+                ncclShmem.comm.npKitEventCollectContexts + npKitCtxIdx);
+          }
+#endif
+
+#if defined(ENABLE_NPKIT) && defined(ENABLE_NPKIT_PRIM_COLLECT_DATA_PROCESS_TIME)
+          if (tid == 0) {
+            npKitDataProcessEntryTime = __builtin_amdgcn_s_memrealtime();
+          }
+#endif
+
           ReduceOrCopyMulti<Unroll, RedOp, T, 1, 1, 1, 1, 0>
-            (tid, nworkers, ncclShmem->redOpArgs, postOp,
-             Recv, (T const**)ncclShmem->groups[group].srcs,
-             Dst, (T**)ncclShmem->groups[group].dsts,
+            (tid, nworkers, ncclShmem.redOpArgs, postOp,
+             Recv, (T const**)ncclShmem.groups[group].srcs,
+             Dst, (T**)ncclShmem.groups[group].dsts,
              sliceSize);
+
+#if defined(ENABLE_NPKIT) && defined(ENABLE_NPKIT_PRIM_COLLECT_DATA_PROCESS_TIME)
+          if (tid == 0) {
+            npKitDataProcessExitTime = __builtin_amdgcn_s_memrealtime();
+            npKitDataProcessTotalTime += npKitDataProcessExitTime - npKitDataProcessEntryTime;
+          }
+#endif
+
+#if defined(ENABLE_NPKIT) && defined(ENABLE_NPKIT_EVENT_PRIM_SIMPLE_REDUCE_OR_COPY_MULTI_EXIT)
+          if (tid == 0) {
+            NpKit::CollectGpuEvent(NPKIT_EVENT_PRIM_SIMPLE_REDUCE_OR_COPY_MULTI_EXIT, sliceSize*sizeof(T), 0, __builtin_amdgcn_s_memrealtime(),
+                ncclShmem.comm.npKitEventCollectContexts + npKitCtxIdx);
+          }
+#endif
+
         } else {
+
+#if defined(ENABLE_NPKIT) && defined(ENABLE_NPKIT_EVENT_PRIM_SIMPLE_REDUCE_OR_COPY_MULTI_ENTRY)
+          if (tid == 0) {
+            NpKit::CollectGpuEvent(NPKIT_EVENT_PRIM_SIMPLE_REDUCE_OR_COPY_MULTI_ENTRY, sliceSize*sizeof(T), 0, __builtin_amdgcn_s_memrealtime(),
+                ncclShmem.comm.npKitEventCollectContexts + npKitCtxIdx);
+          }
+#endif
+
+#if defined(ENABLE_NPKIT) && defined(ENABLE_NPKIT_PRIM_COLLECT_DATA_PROCESS_TIME)
+          if (tid == 0) {
+            npKitDataProcessEntryTime = __builtin_amdgcn_s_memrealtime();
+          }
+#endif
+
           constexpr int PreOpN = SrcBuf != Input ? 0 :
                                  DirectRecv*MaxRecv == NCCL_MAX_DIRECT_ARITY ? (1+NCCL_MAX_DIRECT_ARITY) : 1;
           ReduceOrCopyMulti<Unroll, RedOp, T, Recv+Src, Recv*MaxRecv+Src, Send+Dst, Send*MaxSend+Dst, PreOpN>
-            (tid, nworkers, ncclShmem->redOpArgs, postOp,
-             Recv*fan.nrecv()+Src, (T const**)ncclShmem->groups[group].srcs,
-             Send*fan.nsend()+Dst, (T**)ncclShmem->groups[group].dsts,
+            (tid, nworkers, ncclShmem.redOpArgs, postOp,
+             Recv*fan.nrecv()+Src, (T const**)ncclShmem.groups[group].srcs,
+             Send*fan.nsend()+Dst, (T**)ncclShmem.groups[group].dsts,
              sliceSize);
+
+#if defined(ENABLE_NPKIT) && defined(ENABLE_NPKIT_PRIM_COLLECT_DATA_PROCESS_TIME)
+          if (tid == 0) {
+            npKitDataProcessExitTime = __builtin_amdgcn_s_memrealtime();
+            npKitDataProcessTotalTime += npKitDataProcessExitTime - npKitDataProcessEntryTime;
+          }
+#endif
+
+#if defined(ENABLE_NPKIT) && defined(ENABLE_NPKIT_EVENT_PRIM_SIMPLE_REDUCE_OR_COPY_MULTI_EXIT)
+          if (tid == 0) {
+            NpKit::CollectGpuEvent(NPKIT_EVENT_PRIM_SIMPLE_REDUCE_OR_COPY_MULTI_EXIT, sliceSize*sizeof(T), 0, __builtin_amdgcn_s_memrealtime(),
+                ncclShmem.comm.npKitEventCollectContexts + npKitCtxIdx);
+          }
+#endif
+
         }
         barrier(); // This barrier has a counterpart in following loop
-        //if (Send && (flags & RolePostSend) && index == 0) __threadfence_system();
-        __syncwarp();
+#if defined(__gfx90a__)
+        if ((MaxSend == 0 || MaxRecv == 0) && Send && (flags & RolePostSend) && index == 0) __threadfence_system();
+#else
+        if (Send && (flags & RolePostSend) && index == 0) __threadfence_system();
+#endif
+	__syncwarp();
         postPeer<Recv, Send>();
         offset += sliceSize;
         slice += 1;
@@ -237,7 +338,6 @@ class Primitives<
     // slices are all empty. Since empty slices are the uncommon case, and
     // worker perf is the limiter, perf-wise this loop is effectively unentered,
     // hence just a single branch insn.
-    #pragma unroll 1
     while (slice < SlicePerChunk) {
       sliceSize = sliceSize < nelem-offset ? sliceSize : nelem-offset;
       { // Only workers could have Wait roles so we know the slice must be empty
@@ -245,7 +345,11 @@ class Primitives<
         waitPeer<DirectRecv, DirectSend, Recv, Send, Src, Dst>(0, 0, 0, 0);
       }
       barrier(); // Has couterpart in preceding worker-only loop.
-      //if (Send && (flags & RolePostSend) && sliceSize > 0 && index == 0) __threadfence_system();
+#if defined(__gfx90a__)
+      if ((MaxSend == 0 || MaxRecv == 0) && Send && (flags & RolePostSend) && sliceSize > 0 && index == 0) __threadfence_system();
+#else
+      if (Send && (flags & RolePostSend) && sliceSize > 0 && index == 0) __threadfence_system();
+#endif
       __syncwarp();
       postPeer<Recv, Send>();
       offset += sliceSize;
@@ -265,58 +369,56 @@ class Primitives<
     int sliceSize = stepSize*StepPerSlice;
     int dataSize = max(DIVUP(peerElem, 16*SlicePerChunk)*16, sliceSize/32);  // per-peer slice size
 
-    #pragma unroll 1
     for (int slice=0; slice<SlicePerChunk; ++slice) {
       int realSize = max(0, min(dataSize, peerElem-offset));
       if (tid < nworkers) {
         if (Send) {
           // Scatter pre-scales data of input buffer only in non-Direct case
           constexpr int PreOpN = DirectSend ? 0 : 1;
-          if (flags & RoleInput) ncclShmem->groups[group].srcs[0] = userBuff + inpIx + offset;
-          if (tid == 0) ncclShmem->groups[group].totalSendSize[slice] = 0; // Skip the threadfence
+          if (flags & RoleInput) ncclShmem.groups[group].srcs[0] = userBuff + inpIx + offset;
+          if (tid == 0) ncclShmem.groups[group].totalSendSize[slice] = 0; // Skip the threadfence
           // realSize is not accurate here; but intra-node does not rely on sizes FIFO
           waitPeer<0, DirectSend, 0, 1, 1, 0>(0, inpIx, offset, realSize);
           subBarrier();
-          #pragma unroll 1
+          // Loop over peers
           for (int j=0; j<fan.nsend(); j++) {
             int i = (j+shift)%fan.nsend();
             int peerOffset = i*peerElem;
             // Skip the data I am responsible of reducing myself
             if (skip >= 0 && i >= skip) peerOffset += peerElem;
-            const T* src0 = (T*)ncclShmem->groups[group].srcs[0] + peerOffset;
+            const T* src0 = (T*)ncclShmem.groups[group].srcs[0] + peerOffset;
             int realPeerSize = min(realSize, totalElem-peerOffset);
-            if (realPeerSize > 0 && ncclShmem->groups[group].dsts[i] != nullptr) {
-              ReduceOrCopyMulti<Unroll, RedOp, T, 1, 1, 1, 1, PreOpN>(tid, nworkers, ncclShmem->redOpArgs, false, 1, &src0, 1, (T**)ncclShmem->groups[group].dsts+i, realPeerSize);
+            if (realPeerSize > 0 && ncclShmem.groups[group].dsts[i] != nullptr) {
+              ReduceOrCopyMulti<Unroll, RedOp, T, 1, 1, 1, 1, PreOpN>(tid, nworkers, ncclShmem.redOpArgs, false, 1, &src0, 1, (T**)ncclShmem.groups[group].dsts+i, realPeerSize);
               // Mark for threadfence at the end
-              if (tid == 0) ncclShmem->groups[group].totalSendSize[slice] += realPeerSize;
+              if (tid == 0) ncclShmem.groups[group].totalSendSize[slice] += realPeerSize;
             }
           }
         } else if (Recv) {
-          if (flags & RoleOutput) ncclShmem->groups[group].dsts[0] = userBuff + outIx + offset;
+          if (flags & RoleOutput) ncclShmem.groups[group].dsts[0] = userBuff + outIx + offset;
           int peerOffset = index*peerElem;
           if (skip >= 0 && index >= skip) peerOffset += peerElem;
           // Adjust remote index with peer offset in case we are directly pulling from peer's output buffer
           waitPeer<DirectRecv, 0, 1, 0, 0, 1>(outIx, outIx+peerOffset, offset, realSize);
           subBarrier();
-          if (DirectRecv && ncclShmem->groups[group].srcs[0] == ncclShmem->groups[group].dsts[0]) {
+          if (DirectRecv && ncclShmem.groups[group].srcs[0] == ncclShmem.groups[group].dsts[0]) {
             // Since waitPeer sets srcs[0] to output buffer + offset, we are doing a direct-write based recv
             // Do nothing
           } else {
-            #pragma unroll 1
             for (int j=0; j<fan.nrecv(); j++) {
               int i = (j+shift)%fan.nrecv();
               peerOffset = i*peerElem;
               if (skip >= 0 && i >= skip) peerOffset += peerElem;
-              T* dst0 = (T*)ncclShmem->groups[group].dsts[0] + peerOffset;
+              T* dst0 = (T*)ncclShmem.groups[group].dsts[0] + peerOffset;
               int realPeerSize = min(realSize, totalElem-peerOffset);
-              if (realPeerSize > 0) ReduceOrCopyMulti<Unroll, RedOp, T, 1, 1, 1, 1, 0>(tid, nworkers, ncclShmem->redOpArgs, postOp, 1, (const T**)ncclShmem->groups[group].srcs+i, 1, &dst0, realPeerSize);
+              if (realPeerSize > 0) ReduceOrCopyMulti<Unroll, RedOp, T, 1, 1, 1, 1, 0>(tid, nworkers, ncclShmem.redOpArgs, postOp, 1, (const T**)ncclShmem.groups[group].srcs+i, 1, &dst0, realPeerSize);
             }
           }
         }
       }
       barrier();
       // If we indeed send something, threadfence
-      if (Send && (flags & RolePostSend) && ncclShmem->groups[group].totalSendSize[slice] > 0 && index == 0)
+      if (Send && (flags & RolePostSend) && ncclShmem.groups[group].totalSendSize[slice] > 0 && index == 0)
         __threadfence_system();
       __syncwarp();
       postPeer<Recv, Send>();
@@ -324,19 +426,19 @@ class Primitives<
     }
   }
 
-  __device__ __forceinline__ void loadRecvConn(ncclPeer *peer, int connIndex, struct ncclWorkElem* e) {
+  __device__ __forceinline__ void loadRecvConn(ncclDevChannelPeer *peer, int connIndex, struct ncclWorkElem* e) {
     if (flags & (RoleWaitRecv|RolePostRecv)) {
-      auto *conn = &peer->recv[connIndex].conn;
+      auto *conn = &peer->recv[connIndex];
       step = conn->step;
       step = roundUp(step, SlicePerChunk*StepPerSlice);
       if (flags & RolePostRecv) {
         connStepPtr = conn->head;
-        STORE(connStepPtr, step); // Return credits in case we rounded up.
+        atomicExch_system((unsigned long long *)connStepPtr, step); // Return credits in case we rounded up.
       }
       if (flags & RoleWaitRecv) {
-        ncclShmem->groups[group].recvConns[index] = conn; // WaitRecv role saves since that's who needs it in setDataPtrs()
+        ncclShmem.groups[group].recvConns[index] = conn; // WaitRecv role saves since that's who needs it in setDataPtrs()
         connStepPtr = conn->tail;
-        connStepCache = LOAD(connStepPtr);
+        connStepCache = atomicAdd_system((unsigned long long *)connStepPtr, 0);
         flags |= (conn->offsFifo != nullptr) ? OffsFifoEnabled : 0;
         if (Direct) {
           // User buffers have been registered
@@ -364,18 +466,19 @@ class Primitives<
     }
   }
 
-  __device__ __forceinline__ void loadSendConn(ncclPeer *peer, int connIndex, struct ncclWorkElem* e) {
+  __device__ __forceinline__ void loadSendConn(ncclDevChannelPeer *peer, int connIndex, struct ncclWorkElem* e) {
     if (flags & (RoleWaitSend|RolePostSend)) {
-      auto *conn = &peer->send[connIndex].conn;
+      auto *conn = &peer->send[connIndex];
       step = conn->step;
       step = roundUp(step, SlicePerChunk*StepPerSlice);
       if (flags & RolePostSend) {
         connStepPtr = conn->tail;
+	    next_hdp_reg = conn->next_hdp_reg;
       }
       if (flags & RoleWaitSend) {
-        ncclShmem->groups[group].sendConns[index] = conn; // WaitSend role saves since that's who needs it in setDataPtrs()
+        ncclShmem.groups[group].sendConns[index] = conn; // WaitSend role saves since that's who needs it in setDataPtrs()
         connStepPtr = conn->head;
-        connStepCache = LOAD(connStepPtr);
+        connStepCache = atomicAdd_system((unsigned long long *)connStepPtr, 0);
         flags |= (conn->offsFifo != nullptr) ? OffsFifoEnabled : 0;
         if (flags & OffsFifoEnabled)
           connOffsFifoPtr = conn->offsFifo;
@@ -408,21 +511,20 @@ class Primitives<
   }
 
  public:
-  __device__ Primitives(
+  __forceinline__ __device__ Primitives(
       int tid, int nthreads, int const *recvPeers, int const *sendPeers,
       void const *inputBuf, void *outputBuf, uint64_t redOpArg, uint32_t group=0, struct ncclWorkElem* e = nullptr
     ):
     tid(tid),
-    stepSize(ncclShmem->comm.buffSizes[NCCL_PROTO_SIMPLE]/NCCL_STEPS/sizeof(T)),
-    opCount(ncclShmem->work.elems[0].opCount) {
+    stepSize(ncclShmem.comm.buffSizes[NCCL_PROTO_SIMPLE]/NCCL_STEPS/sizeof(T)) {
 
     // For send operations, we need an extra warp to overlap the threadfence and the copy
     this->nthreads = nthreads;
     this->nworkers = nthreads;
     this->group = group & (uint16_t)0xFFFF;
     int connIndex = group >> 16;
-    barriers = &ncclShmem->groups[this->group].barrier;
-    barrier_next = ncclShmem->groups[this->group].barrier_next;
+    barriers = &ncclShmem.groups[this->group].barrier;
+    barrier_next = ncclShmem.groups[this->group].barrier_next;
 
     int nrecv=0, nsend=0;
     while (nrecv < MaxRecv && recvPeers[nrecv] != -1) nrecv++;
@@ -452,30 +554,30 @@ class Primitives<
     if (flags & (RoleWaitRecv|RolePostRecv)) peer = recvPeers[index];
     if (flags & (RoleWaitSend|RolePostSend)) peer = sendPeers[index];
 
-    loadRecvConn(&ncclShmem->channel.devPeers[peer], connIndex, e);
-    loadSendConn(&ncclShmem->channel.devPeers[peer], connIndex, e);
+    loadRecvConn(&ncclShmem.channel.peers[peer], connIndex, e);
+    loadSendConn(&ncclShmem.channel.peers[peer], connIndex, e);
 
     setDataPtrs(inputBuf, outputBuf, redOpArg, (struct ncclWorkElemReg*)e);
   }
 
-  __device__ ~Primitives() {
-    // Ensure ncclShmem->groups[].send/recvConns are available
+  __forceinline__ __device__ ~Primitives() {
+    // Ensure ncclShmem.groups[].send/recvConns are available
     if (!(flags & ThreadsSynced))
       barrier();
     // Save steps for the next operation
     if (flags & (RolePostSend|RolePostRecv)) {
-      auto *conns = (flags & RolePostSend) ? ncclShmem->groups[group].sendConns : ncclShmem->groups[group].recvConns;
-      STORE(&conns[index]->step, step);
+      auto *conns = (flags & RolePostSend) ? ncclShmem.groups[group].sendConns : ncclShmem.groups[group].recvConns;
+      conns[index]->step = step;
     }
     // Make sure all threads are done writing back conn->step and done using
-    // ncclShmem->groups[group]
+    // ncclShmem.groups[group]
     barrier();
   }
 
   __device__ void setDataPtrs(void const *inputBuf, void *outputBuf, uint64_t redOpArg, struct ncclWorkElemReg* e) {
     if (flags & RoleInput) {
       userBuff = (T*)inputBuf;
-      ncclShmem->redOpArgs[0] = redOpArg;  // scaler for local input
+      ncclShmem.redOpArgs[0] = redOpArg;  // scaler for local input
     }
     if (flags & RoleOutput) userBuff = (T*)outputBuf;
     bool recvProvider = flags == (flags|RoleWaitRecv|DirectWrite);
@@ -486,9 +588,9 @@ class Primitives<
 
     if (Direct && recvProvider) {
       int spins = 0;
-      void *volatile *slot = ncclShmem->groups[group].recvConns[index]->ptrExchange;
+      void *volatile *slot = ncclShmem.groups[group].recvConns[index]->ptrExchange;
       // Wait for consumer to consume previous value before trampling it.
-      while (LOAD(slot) != nullptr && !checkAbort(spins));
+      while ((void *)atomicAdd_system((unsigned long long *) slot,0) != nullptr && !checkAbort(spins));
       directBuff = (T*)outputBuf;
       // Encode pointer by XOR'ing against some address they definitely wouldn't send
       // since we want to allow them sending us nullptr while not colliding with
@@ -497,10 +599,10 @@ class Primitives<
     }
     if (Direct && sendAcceptor) {
       int spins = 0;
-      void *volatile *slot = ncclShmem->groups[group].sendConns[index]->ptrExchange;
+      void *volatile *slot = ncclShmem.groups[group].sendConns[index]->ptrExchange;
       void *ptr;
       while (true) {
-        ptr = LOAD(slot);
+        ptr = (void *)atomicAdd_system((unsigned long long *) slot,0);
         if (ptr != nullptr || checkAbort(spins)) break;
       }
       directBuff = regUsed ? (T*)(e->dnOutputs[index]) :
@@ -509,11 +611,11 @@ class Primitives<
     }
     if (Direct && sendProvider) {
       int spins = 0;
-      void *volatile *slot = ncclShmem->groups[group].sendConns[index]->ptrExchange;
-      volatile uint64_t* argSlot0 = ncclShmem->groups[group].sendConns[index]->redOpArgExchange;
-      volatile uint64_t* argSlot1 = ncclShmem->groups[group].sendConns[index]->redOpArgExchange+1;
+      void *volatile *slot = ncclShmem.groups[group].sendConns[index]->ptrExchange;
+      volatile uint64_t* argSlot0 = ncclShmem.groups[group].sendConns[index]->redOpArgExchange;
+      volatile uint64_t* argSlot1 = ncclShmem.groups[group].sendConns[index]->redOpArgExchange+1;
       // Wait for consumer to consume previous value before trampling it.
-      while ((*slot != nullptr || *argSlot0 != 0 || *argSlot1 !=0) && !checkAbort(spins));
+      while (((void *)atomicAdd_system((unsigned long long *) slot,0) != nullptr || *argSlot0 != 0 || *argSlot1 !=0) && !checkAbort(spins));
       // If there is no recv, then we are directly pulling from input buffer (e.g. directScatter)
       // Otherwise, we are pulling from output buffer (e.g. recvCopyDirectSend)
       directBuff = MaxRecv == 0 ? (T*)inputBuf : (T*)outputBuf;
@@ -527,12 +629,12 @@ class Primitives<
     }
     if (Direct && recvAcceptor) {
       int spins = 0;
-      void *volatile *slot = ncclShmem->groups[group].recvConns[index]->ptrExchange;
-      volatile uint64_t* argSlot0 = ncclShmem->groups[group].recvConns[index]->redOpArgExchange;
-      volatile uint64_t* argSlot1 = ncclShmem->groups[group].recvConns[index]->redOpArgExchange+1;
+      void *volatile *slot = ncclShmem.groups[group].recvConns[index]->ptrExchange;
+      volatile uint64_t* argSlot0 = ncclShmem.groups[group].recvConns[index]->redOpArgExchange;
+      volatile uint64_t* argSlot1 = ncclShmem.groups[group].recvConns[index]->redOpArgExchange+1;
       void *ptr;
       while (true) {
-        ptr = *slot;
+        ptr = (void *)atomicAdd_system((unsigned long long *) slot,0);
         if (ptr != nullptr || checkAbort(spins)) break;
       }
       directBuff = regUsed ? (T*)(MaxSend == 0 ? e->upOutputs[index] : e->dnInputs[index]) :
@@ -545,7 +647,7 @@ class Primitives<
           arg1 = *argSlot1;
           if ((arg0 != 0 && arg1 != 0) || checkAbort(spins)) break;
         }
-        ncclShmem->redOpArgs[1+index] = ((arg1 & 0xffffffff)<<32) | (arg0 & 0xffffffff);
+        ncclShmem.redOpArgs[1+index] = ((arg1 & 0xffffffff)<<32) | (arg0 & 0xffffffff);
       }
       *argSlot0 = 0; *argSlot1 = 0;
       *slot = nullptr;

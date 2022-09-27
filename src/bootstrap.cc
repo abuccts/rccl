@@ -12,6 +12,7 @@
 #include <unistd.h>
 #include <sys/types.h>
 #include "proxy.h"
+#include "signals.h" // [RCCL]
 
 /* Init functions */
 static char bootstrapNetIfName[MAX_IF_NAME_SIZE+1];
@@ -105,6 +106,7 @@ static void *bootstrapRoot(void* args) {
   do {
     struct ncclSocket sock;
     sock.abortFlag = NULL;
+    /* bootstrap root thread always uses blocking ncclSocketAccept. */
     NCCLCHECKGOTO(ncclSocketAccept(&sock, listenSock), res, out);
     NCCLCHECKGOTO(bootstrapNetRecv(&sock, &info, sizeof(info)), res, out);
     close(sock.fd);
@@ -139,6 +141,7 @@ static void *bootstrapRoot(void* args) {
     int next = (r+1) % nranks;
     struct ncclSocket sock;
     sock.abortFlag = NULL;
+    sock.asyncFlag = 0;
     memcpy(&sock.addr, rankAddressesRoot+r, sizeof(union ncclSocketAddress));
     NCCLCHECKGOTO(ncclSocketConnect(&sock), res, out);
     NCCLCHECKGOTO(bootstrapNetSend(&sock, rankAddresses+next, sizeof(union ncclSocketAddress)), res, out);
@@ -165,8 +168,8 @@ ncclResult_t bootstrapCreateRoot(ncclUniqueId* id, bool idFromEnv) {
   memcpy(id, &listenSock->addr, sizeof(union ncclSocketAddress));
   pthread_t thread;
   pthread_create(&thread, NULL, bootstrapRoot, (void*)listenSock);
-  pthread_detach(thread); // will not be pthread_join()'d
   ncclSetThreadName(thread, "NCCL BootstrapR");
+  pthread_detach(thread); // will not be pthread_join()'d
   return ncclSuccess;
 }
 
@@ -207,20 +210,27 @@ struct bootstrapState {
   int cudaDev;
   int rank;
   int nranks;
+  int virtualId;
   volatile uint32_t *abortFlag;
 };
 
 ncclResult_t bootstrapInit(ncclUniqueId * id, struct ncclComm* comm) {
   int rank = comm->rank;
   int nranks = comm->nRanks;
+  int virtualId = comm->virtualId;
   struct bootstrapState* state;
   NCCLCHECK(ncclCalloc(&state, 1));
   state->rank = rank;
   state->nranks = nranks;
   state->abortFlag = comm->abortFlag;
+  state->virtualId = virtualId;
   comm->bootstrap = state;
 
-  TRACE(NCCL_INIT, "rank %d nranks %d", rank, nranks);
+  TRACE(NCCL_INIT, "rank %d nranks %d virtualId %d", rank, nranks, virtualId);
+
+  // [RCCL] Register custom signal handlers if requested
+  RegisterSignalHandlers();
+  // [/RCCL]
 
   struct extInfo info = { 0 };
   info.rank = rank;
@@ -281,7 +291,7 @@ ncclResult_t bootstrapInit(ncclUniqueId * id, struct ncclComm* comm) {
   NCCLCHECK(bootstrapAllGather(state, state->peerProxyAddresses, sizeof(union ncclSocketAddress)));
   NCCLCHECK(ncclProxyInit(comm, proxySocket, state->peerProxyAddresses));
 
-  TRACE(NCCL_INIT, "rank %d nranks %d - DONE", rank, nranks);
+  TRACE(NCCL_INIT, "rank %d nranks %d virtualId %d", rank, nranks, virtualId);
 
   return ncclSuccess;
 }
@@ -316,6 +326,7 @@ ncclResult_t bootstrapSend(void* commState, int peer, int tag, void* data, int s
   struct bootstrapState* state = (struct bootstrapState*)commState;
   struct ncclSocket sock;
   sock.abortFlag = state->abortFlag;
+  sock.asyncFlag = 0;
   memcpy(&sock.addr, state->peerCommAddresses+peer, sizeof(union ncclSocketAddress));
   NCCLCHECK(ncclSocketConnect(&sock));
   NCCLCHECK(bootstrapNetSend(&sock, &state->rank, sizeof(int)));

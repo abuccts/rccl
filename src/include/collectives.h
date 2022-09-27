@@ -32,13 +32,25 @@ struct ncclDevRedOpFull {
 #define NCCL_KERN_NAME(func, algo, proto, devredop, type) \
   ncclKernel_##func##_##algo##_##proto##_##devredop##_##type
 
+#define NCCL_KERN_NAME_DEBUG(func, algo, proto, devredop, type) \
+  ncclKernelDebug_##func##_##algo##_##proto##_##devredop##_##type
+
+#define NCCL_KERN_NAME_LL128(func, algo, proto, devredop, type) \
+  ncclKernelLL128_##func##_##algo##_##proto##_##devredop##_##type
+
+#define NCCL_KERN_NAME_LL128_DEBUG(func, algo, proto, devredop, type) \
+  ncclKernelLL128Debug_##func##_##algo##_##proto##_##devredop##_##type
+
 #define NCCL_IMPL_NAME(func, algo, proto) \
   nccl##func##algo##proto
 
 /* Declare all collective operations */
 #define DECL5(func, algo, proto, devredop, type) \
   extern __device__ __attribute__((noinline)) void NCCL_FUNC_NAME(func, algo, proto, devredop, type)(); \
-  extern __global__ void NCCL_KERN_NAME(func, algo, proto, devredop, type)(struct ncclDevComm* comm, struct ncclWorkElem c); \
+  extern __global__ void NCCL_KERN_NAME(func, algo, proto, devredop, type)(struct ncclDevComm* comm, uint64_t channelMask, struct ncclWork* workHead); \
+  extern __global__ void NCCL_KERN_NAME_DEBUG(func, algo, proto, devredop, type)(struct ncclDevComm* comm, uint64_t channelMask, struct ncclWork* workHead); \
+  extern __global__ void NCCL_KERN_NAME_LL128(func, algo, proto, devredop, type)(struct ncclDevComm* comm, uint64_t channelMask, struct ncclWork* workHead); \
+  extern __global__ void NCCL_KERN_NAME_LL128_DEBUG(func, algo, proto, devredop, type)(struct ncclDevComm* comm, uint64_t channelMask, struct ncclWork* workHead);
 
 #define CONCAT(a,b) a##b
 #define MACRO_IF(cond, t, f) CONCAT(MACRO_IF_, cond)(t, f)
@@ -110,24 +122,18 @@ extern __device__ void NCCL_ONERANK_REDUCE_NAME(PreMulSum, float)();
 extern __device__ void NCCL_ONERANK_REDUCE_NAME(PreMulSum, double)();
 
 // CHUNKSIZE must be a multiple of SLICESIZE
-//#define ALLREDUCE_SLICESTEPS (NCCL_STEPS/4)
-//#define ALLREDUCE_CHUNKSTEPS (NCCL_STEPS/2)
-//#define ALLGATHER_SLICESTEPS (NCCL_STEPS/4)
-//#define ALLGATHER_CHUNKSTEPS (NCCL_STEPS/2)
-//#define REDUCESCATTER_SLICESTEPS (NCCL_STEPS/4)
-//#define REDUCESCATTER_CHUNKSTEPS (NCCL_STEPS/2)
-#define ALLREDUCE_SLICESTEPS 2
-#define ALLREDUCE_CHUNKSTEPS 4
-#define ALLGATHER_SLICESTEPS 4
-#define ALLGATHER_CHUNKSTEPS 4
-#define REDUCESCATTER_SLICESTEPS 2
-#define REDUCESCATTER_CHUNKSTEPS 4
+#define ALLREDUCE_SLICESTEPS (NCCL_STEPS/4)
+#define ALLREDUCE_CHUNKSTEPS (NCCL_STEPS/2)
+#define ALLGATHER_SLICESTEPS (NCCL_STEPS/4)
+#define ALLGATHER_CHUNKSTEPS (NCCL_STEPS/2)
+#define REDUCESCATTER_SLICESTEPS (NCCL_STEPS/4)
+#define REDUCESCATTER_CHUNKSTEPS (NCCL_STEPS/2)
 #define BROADCAST_SLICESTEPS 1
-#define BROADCAST_CHUNKSTEPS 4
+#define BROADCAST_CHUNKSTEPS 1
 #define REDUCE_SLICESTEPS 1
-#define REDUCE_CHUNKSTEPS 4
-#define SENDRECV_SLICEFACTOR 1
-#define NCCL_MAX_SLICE_PER_CHUNK 4  // max value for CHUNKSTEPS/SLICESTEPS, must accord with above
+#define REDUCE_CHUNKSTEPS 1
+#define SENDRECV_SLICEFACTOR 4
+#define NCCL_MAX_SLICE_PER_CHUNK 2  // max value for CHUNKSTEPS/SLICESTEPS, must accord with above
 #define ALLTOALL_PIVOT_SLICESTEPS 2
 #define ALLTOALL_PIVOT_CHUNKSTEPS 4
 

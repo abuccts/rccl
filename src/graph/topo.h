@@ -52,13 +52,28 @@ extern const char* topoNodeTypeStr[];
 #define LINK_NET 8
 extern const char* topoLinkTypeStr[];
 
+// Local (myself)
 #define PATH_LOC 0
+
+// Connection traversing NVLink
 #define PATH_NVL 1
+
+// Connection through NVLink using an intermediate GPU
 #define PATH_NVB 2
+
+// Connection traversing at most a single PCIe bridge
 #define PATH_PIX 3
+
+// Connection traversing multiple PCIe bridges (without traversing the PCIe Host Bridge)
 #define PATH_PXB 4
+
+// Connection between a GPU and a NIC using an intermediate GPU. Used to enable rail-local, aggregated network send/recv operations.
 #define PATH_PXN 5
+
+// Connection traversing PCIe as well as a PCIe Host Bridge (typically the CPU)
 #define PATH_PHB 6
+
+// Connection traversing PCIe as well as the SMP interconnect between NUMA nodes (e.g., QPI/UPI)
 #define PATH_SYS 7
 #define PATH_DIS 7
 extern const char* topoPathTypeStr[];
@@ -88,7 +103,10 @@ struct ncclTopoLinkList {
 #define RCCL_TOPO_4P2H_ROME 2
 #define RCCL_TOPO_GDR_ALL   4
 #define RCCL_TOPO_16P1H     8
+#define RCCL_TOPO_FORCE_INTRA 16
+#define RCCL_TOPO_XGMI_ALL  32
 
+#define RCCL_TOPO_MAX_RANKS_PER_GPU 8
 struct ncclTopoNode {
   int type;
   int64_t id;
@@ -96,7 +114,8 @@ struct ncclTopoNode {
   union {
     struct {
       int dev; // NVML dev number
-      int rank;
+      int rank[RCCL_TOPO_MAX_RANKS_PER_GPU];
+      int nRanksPerGpu;
       int cudaCompCap;
       int gdrSupport;
       int gcn;
@@ -146,6 +165,7 @@ struct ncclTopoSystem {
 
   bool pivotA2AEnabled;
   int pivotA2ANumBiRings;
+  bool ll128Enabled;
 };
 
 ncclResult_t ncclTopoGetNode(struct ncclTopoSystem* system, struct ncclTopoNode** node, int type, uint64_t id);
@@ -176,8 +196,21 @@ static ncclResult_t ncclTopoIdToIndex(struct ncclTopoSystem* system, int type, i
 static ncclResult_t ncclTopoRankToIndex(struct ncclTopoSystem* system, int rank, int* index) {
   *index = -1;
   for (int i=0; i<system->nodes[GPU].count; i++) {
-    if (system->nodes[GPU].nodes[i].gpu.rank == rank) {
-      *index = i;
+    for (int j=0; j<system->nodes[GPU].nodes[i].gpu.nRanksPerGpu; j++ ) {
+      if (system->nodes[GPU].nodes[i].gpu.rank[j] == rank) {
+	    *index = i;
+	    return ncclSuccess;
+      }
+    }
+  }
+  return ncclInternalError;
+}
+
+static ncclResult_t ncclTopoDevToRank(struct ncclTopoSystem* system, int dev, int* rank) {
+  *rank = -1;
+  for (int i=0; i<system->nodes[GPU].count; i++) {
+    if (system->nodes[GPU].nodes[i].gpu.dev == dev) {
+      *rank = system->nodes[GPU].nodes[i].gpu.rank[0];
       return ncclSuccess;
     }
   }
@@ -188,4 +221,8 @@ static ncclResult_t ncclTopoRankToIndex(struct ncclTopoSystem* system, int rank,
 static float ncclTopoXGMISpeed(int gcn) {
   return gcn == 910 ? MI200_XGMI_WIDTH : VEGA_XGMI_WIDTH;
 }
+
+#define ncclGetKernelIndex(p_comm) \
+  (((p_comm)->topo->ll128Enabled ? 1 : 0)*2 + ((p_comm)->collTraceThread ? 1 : 0))
+
 #endif

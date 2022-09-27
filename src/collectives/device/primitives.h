@@ -23,7 +23,7 @@
     if (wid == 0) { \
       barrier_next[w] += nthreads/WARP_SIZE; \
       atomicAdd((unsigned long long *)barriers, 1); \
-      while (atomicAdd((unsigned long long *)barriers, 0) < barrier_next[w]) __builtin_amdgcn_s_sleep(8); \
+      while (atomicAdd((unsigned long long *)barriers, 0) < barrier_next[w]) __builtin_amdgcn_s_sleep(1); \
       __asm__ __volatile__("s_wakeup"); \
     } \
   } \
@@ -45,7 +45,7 @@ struct ProtoSimple {
 
   // Data bytes (no flags etc) in one step of the fifo queue.
   __device__ static int calcBytePerStep() {
-    return ncclShmem->comm.buffSizes[NCCL_PROTO_SIMPLE]/NCCL_STEPS;
+    return ncclShmem.comm.buffSizes[NCCL_PROTO_SIMPLE]/NCCL_STEPS;
   }
   // Granularity of data bytes transferred per thread.
   __device__ static int calcBytePerGrain() {
@@ -63,7 +63,7 @@ struct ProtoLL {
 
   // Data bytes (no flags etc) in one step of the fifo queue.
   __device__ static int calcBytePerStep() {
-    return ncclShmem->comm.buffSizes[NCCL_PROTO_LL]/NCCL_STEPS/2; // Half is data
+    return ncclShmem.comm.buffSizes[NCCL_PROTO_LL]/NCCL_STEPS/2; // Half is data
   }
   // Granularity of data bytes transferred per thread.
   __device__ static int calcBytePerGrain() {
@@ -81,7 +81,7 @@ struct ProtoLL128 {
 
   // Data bytes (no flags etc) in one step of the fifo queue.
   __device__ static int calcBytePerStep() {
-    return (ncclShmem->comm.buffSizes[NCCL_PROTO_LL128]/NCCL_STEPS)*NCCL_LL128_DATAELEMS/NCCL_LL128_LINEELEMS;
+    return (ncclShmem.comm.buffSizes[NCCL_PROTO_LL128]/NCCL_STEPS)*NCCL_LL128_DATAELEMS/NCCL_LL128_LINEELEMS;
   }
   // Granularity of data bytes transferred per thread.
   __device__ static int calcBytePerGrain() {
@@ -155,17 +155,4 @@ struct PrimitivesWithoutDirect {
 #include "prims_simple.h"
 #include "prims_ll.h"
 #include "prims_ll128.h"
-
-#ifdef ENABLE_PROFILING
-#define INIT_COUNTER \
-  if (tid == 0) { struct ncclProfElem *elem = devProf.elems+args->opCount%PROFILE_NUM_ITEMS; t0 = __builtin_amdgcn_s_memrealtime(); ws = elem->elem[blockIdx.x].wait_cycle; }
-#define ACCUMULATE_COUNTER(prim) \
-  if (tid == 0) { struct ncclProfElem *elem = devProf.elems+args->opCount%PROFILE_NUM_ITEMS; elem->elem[blockIdx.x].prim##_cycle += (__builtin_amdgcn_s_memrealtime() - t0 \
-    + ws - elem->elem[blockIdx.x].wait_cycle); \
-    elem->elem[blockIdx.x].prim##_byte += nelem * sizeof(T); elem->elem[blockIdx.x].opCount = args->opCount;}
-#else
-#define INIT_COUNTER
-#define ACCUMULATE_COUNTER(prim)
-#endif
-
 #endif
