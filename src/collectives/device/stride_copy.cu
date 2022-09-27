@@ -17,9 +17,11 @@ hipError_t strideMemcpyAsync(void *dst, const void *src, const size_t size, cons
   if (strideMemcpyGridsize == 0 || strideMemcpyBlocksize == 0)
     hipOccupancyMaxPotentialBlockSize(&strideMemcpyGridsize, &strideMemcpyBlocksize, strideMemcpyKernel<uint4>);
 
-  if (size < sizeof(uint4))
-    hipLaunchKernelGGL((strideMemcpyKernel<char>), strideMemcpyGridsize, strideMemcpyBlocksize, 0, stream, (char*)dst, (char*)src, size, height, width);
-  else
+  if (size % sizeof(uint4) == 0)
     hipLaunchKernelGGL((strideMemcpyKernel<uint4>), strideMemcpyGridsize, strideMemcpyBlocksize, 0, stream, (uint4*)dst, (uint4*)src, size/sizeof(uint4), height, width);
+  else if (size % sizeof(uint1) == 0)
+    hipLaunchKernelGGL((strideMemcpyKernel<uint1>), strideMemcpyGridsize, strideMemcpyBlocksize, 0, stream, (uint1*)dst, (uint1*)src, size/sizeof(uint1), height, width);
+  else
+    hipLaunchKernelGGL((strideMemcpyKernel<char>), strideMemcpyGridsize, strideMemcpyBlocksize, 0, stream, (char*)dst, (char*)src, size, height, width);
   return hipSuccess;
 }
